@@ -11,25 +11,22 @@ import csv
 import time
 import subprocess
 from datetime import datetime, timedelta
-import os
-import sys
-import json
-import csv
-import time
-import subprocess
-from datetime import datetime, timedelta
 from groq import Groq
+import io
 
 # --- CONFIGURATION ---
 GROQ_MODEL_ID = "llama-3.3-70b-versatile" 
 
-def get_groq_client():
+def get_groq_client(api_key=None):
     """Configure et retourne le client Groq."""
-    api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
+        api_key = os.environ.get("GROQ_API_KEY")
+    
+    if not api_key:
+        # En mode CLI, on exit. En mode lib, on pourra gérer l'erreur plus haut.
         print("❌ CRITIQUE : Variable GROQ_API_KEY manquante.")
         print("   Exportez-la : export GROQ_API_KEY='votre_clé'")
-        sys.exit(1)
+        return None
     return Groq(api_key=api_key)
 
 def call_llm(prompt: str, client: Groq) -> str:
@@ -107,7 +104,7 @@ def get_video_details(video_url: str) -> dict:
         pass
     return {}
 
-def prequalify(details: dict) -> tuple[bool, str, list]:
+def prequalify(details: dict, subs_min: int = 0, subs_max: int = 500000) -> tuple[bool, str, list]:
     """Hard gates pour disqualifier AVANT appel IA."""
     subs = details.get("subscriber_count")
     duration = details.get("duration", 0)
@@ -115,9 +112,12 @@ def prequalify(details: dict) -> tuple[bool, str, list]:
 
     red_flags = []
     
-    # Règle 1: Gros Créateur
-    if subs and subs >= 500000:
-        return False, "Chaîne trop grosse (>500k)", ["too_big"]
+    # Règle 1: Taille de la chaîne (Min/Max dynamic)
+    if subs is not None:
+        if subs > subs_max:
+            return False, f"Chaîne trop grosse (>{subs_max})", ["too_big"]
+        if subs < subs_min:
+             return False, f"Chaîne trop petite (<{subs_min})", ["too_small"]
         
     # Règle 2: Masterclass > 1h
     if duration and duration >= 3600:
@@ -256,11 +256,10 @@ Réponds UNIQUEMENT le JSON.
             "language_version": lang_version
         }
 
-# --- EXPORT ---
-def save_to_csv(results: list, query: str):
-    filename = "prospects.csv"
-    file_exists = os.path.isfile(filename)
-    
+# --- CSV GENERATION ---
+def generate_csv_string(results: list, query: str) -> str:
+    """Génère le contenu CSV en mémoire."""
+    output = io.StringIO()
     fieldnames = [
         "run_timestamp", "niche", "query_used", "channel", 
         "video_title", "video_url", "upload_date", "subscriber_count", 
@@ -268,102 +267,93 @@ def save_to_csv(results: list, query: str):
         "language_version", "reason", "evidence", "prospecting_message", "red_flags"
     ]
     
-    with open(filename, 'a', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-            
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        for res in results:
-            writer.writerow({
-                "run_timestamp": timestamp,
-                "niche": query,
-                "query_used": query,
-                "channel": res.get("channel"),
-                "video_title": res.get("video_title"),
-                "video_url": res.get("url"),
-                "upload_date": res.get("upload_date"),
-                "subscriber_count": res.get("subscriber_count"),
-                "view_count": res.get("view_count"),
-                "lead_score": res.get("analysis", {}).get("lead_score"),
-                "needs_editor": res.get("analysis", {}).get("needs_editor"),
-                "language_version": res.get("analysis", {}).get("language_version"),
-                "reason": res.get("analysis", {}).get("reason"),
-                "evidence": "; ".join(res.get("analysis", {}).get("evidence", [])),
-                "prospecting_message": res.get("analysis", {}).get("prospecting_message"),
-                "red_flags": ";".join(res.get("analysis", {}).get("red_flags", []))
-            })
-    print(f"\n💾 Données sauvegardées dans '{filename}'")
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for res in results:
+        writer.writerow({
+            "run_timestamp": timestamp,
+            "niche": query,
+            "query_used": query,
+            "channel": res.get("channel"),
+            "video_title": res.get("video_title"),
+            "video_url": res.get("url"),
+            "upload_date": res.get("upload_date"),
+            "subscriber_count": res.get("subscriber_count"),
+            "view_count": res.get("view_count"),
+            "lead_score": res.get("analysis", {}).get("lead_score"),
+            "needs_editor": res.get("analysis", {}).get("needs_editor"),
+            "language_version": res.get("analysis", {}).get("language_version"),
+            "reason": res.get("analysis", {}).get("reason"),
+            "evidence": "; ".join(res.get("analysis", {}).get("evidence", [])),
+            "prospecting_message": res.get("analysis", {}).get("prospecting_message"),
+            "red_flags": ";".join(res.get("analysis", {}).get("red_flags", []))
+        })
+    
+    return output.getvalue()
 
-# --- MAIN LOOP ---
-def main():
-    print("\n" + "═" * 60)
-    print("💎 GROQ YOUTUBE PROSPECTOR - V1.0 (STRICT MODE)")
-    print("═" * 60)
+# --- MAIN RUNNER FUNCTION (FOR STREAMLIT) ---
+def run_prospector(niche, language, max_analyze, subs_min=0, subs_max=500000, api_key=None, logger=None):
+    """
+    Fonction principale appelée par Streamlit ou CLI.
+    Retourne un dictionnaire avec {summary, rows, rejections, csv_content}
+    """
     
-    client = get_groq_client()
-    
-    # 1. Inputs Utilisateur
-    niche = input("🎯 Niche (ex: Fitness, Immo, Crypto): ").strip()
-    if not niche: 
-        print("❌ Niche requise."); return
+    def log(msg):
+        if logger:
+            logger(msg)
+        else:
+            print(msg)
 
-    lang_choice = input("🌍 Version (fr/en) [fr]: ").strip().lower() or "fr"
-    if lang_choice not in ["fr", "en"]: lang_choice = "fr"
+    log(f"🚀 Démarrage Prospector pour '{niche}' ({language})")
     
-    try:
-        max_analyze = int(input("🔢 Nb max à analyser [10]: ").strip() or "10")
-    except:
-        max_analyze = 10
-        
-    export_csv = input("💾 Exporter CSV? (o/n) [o]: ").strip().lower() or "o"
+    client = get_groq_client(api_key)
+    if not client:
+        raise ValueError("Clé API Groq manquante")
 
-    # 2. Recherche
-    print(f"\n🔍 Recherche 'strict 30 jours' pour: {niche}...")
-    # On cherche large (x3) pour avoir du rab après filtrage
-    raw_videos = search_search_videos(niche, max_analyze * 3)
-    
-    print(f"   -> {len(raw_videos)} vidéos brutes trouvées.")
-    
-    # 3. Filtrage & Analyse
+    # 1. Recherche
+    log(f"🔍 Recherche de candidats (target: {max_analyze})...")
+    raw_videos = search_search_videos(niche, max_analyze * 3) # x3 pour marge
+    log(f"   -> {len(raw_videos)} vidéos brutes trouvées.")
+
     analyzed_count = 0
     final_results = []
+    rejections = []
     
-    print("\n🚀 Démarrage de l'analyse approfondie...")
-    start_time = time.time()
+    # 2. Analyse
+    log("🧠 Analyse approfondie en cours...")
     
     for vid in raw_videos:
         if analyzed_count >= max_analyze:
             break
             
-        # Get details
-        print(f"   ⏳ Récupération data: {vid['title'][:40]}...")
         details = get_video_details(vid['url'])
-        
-        if not details: 
-            print("      ⏭️  Skip (data error)")
+        if not details:
             continue
             
-        # Filtre Date Strict (30 jours)
+        # Filtre Date
         if not is_video_recent(details.get("upload_date"), days=30):
             d = format_date(details.get("upload_date", ""))
-            print(f"      🗑️  Rejet: Trop vieux ({d})")
-            continue
-            
-        # HARD GATES / PREQUALIFICATION
-        is_allowed, reason, gates_flags = prequalify(details)
-        if not is_allowed:
-            print(f"      ⛔ DISQUALIFIÉ (Hard Gate): {reason}")
+            rejections.append({"channel": details.get("channel", "Inconnu"), "reason": f"Trop vieux ({d})", "url": vid['url']})
             continue
 
-        # Analyse IA
-        print("      🧠 Analyse Groq en cours...")
-        analysis = analyze_candidate(details, lang_choice, client)
+        # Hard Gates
+        is_allowed, reason, gates_flags = prequalify(details, subs_min, subs_max)
+        if not is_allowed:
+            rejections.append({"channel": details.get("channel", "Inconnu"), "reason": reason, "url": vid['url']})
+            continue
+            
+        log(f"   Running AI on: {details.get('channel')}...")
         
-        # Merge red flags
+        # AI Analysis
+        analysis = analyze_candidate(details, language, client)
         analysis["red_flags"] = gates_flags + analysis.get("red_flags", [])
         
-        # Stockage
+        # Adaptation pour Streamlit (mapping message options)
+        analysis["message_option_1"] = analysis.get("prospecting_message")
+        analysis["message_option_2"] = "Option alternative non générée par ce modèle."
+
         result_pkg = {
             "channel": details.get("channel"),
             "video_title": details.get("title"),
@@ -373,37 +363,64 @@ def main():
             "view_count": details.get("view_count"),
             "analysis": analysis
         }
+        
         final_results.append(result_pkg)
         analyzed_count += 1
         
-        # Affichage temps réel
-        score = analysis.get("lead_score", 0)
-        status = "✅ QUALIFIÉ" if analysis.get("needs_editor") else "❌ REJETÉ"
-        print(f"      🎯 Score: {score}/100 | {status}")
-        if analysis.get("needs_editor"):
-            print(f"         💡 {analysis.get('reason')}")
-        print("")
+        status = "✅" if analysis.get("needs_editor") else "❌"
+        log(f"      {status} Score: {analysis.get('lead_score')} - {details.get('channel')}")
 
-    # 4. Synthèse
-    duration = time.time() - start_time
+    # 3. Synthèse
     qualified = [r for r in final_results if r["analysis"].get("needs_editor")]
     
+    summary = {
+        "total_found": len(raw_videos),
+        "analyzed": analyzed_count,
+        "qualified": len(qualified)
+    }
+    
+    csv_content = generate_csv_string(final_results, niche)
+    
+    log(f"🏁 Fini ! {len(qualified)} leads qualifiés trouvés.")
+    
+    return {
+        "summary": summary,
+        "rows": final_results,
+        "rejections": rejections,
+        "csv_content": csv_content
+    }
+
+# --- CLI WRAPPER ---
+def main():
     print("\n" + "═" * 60)
-    print(f"🏁 TERMINÉ en {duration:.1f}s")
-    print(f"📊 Analysés: {len(final_results)} | Qualifiés: {len(qualified)}")
+    print("💎 GROQ YOUTUBE PROSPECTOR - CLI MODE")
     print("═" * 60)
     
-    for q in qualified:
-        a = q["analysis"]
-        print(f"\n🏆 LEAD: {q['channel']}")
-        print(f"   📺 Vidéo: {q['video_title']}")
-        print(f"   📈 Abonnés: {q.get('subscriber_count', 'N/A')}")
-        print(f"   🔍 Preuves: {', '.join(a.get('evidence', []))}")
-        print(f"   ✉️  Message ({lang_choice}):")
-        print(f"   \"{a.get('prospecting_message')}\"")
+    # Inputs simples pour CLI
+    niche = input("🎯 Niche: ").strip()
+    if not niche: return
+
+    lang = input("🌍 Langue (fr/en) [fr]: ").strip() or "fr"
+    
+    try:
+        max_v = int(input("🔢 Max analyse [5]: ").strip() or "5")
+    except:
+        max_v = 5
         
-    if export_csv == "o" and final_results:
-        save_to_csv(final_results, niche)
+    # Lancement
+    results = run_prospector(
+        niche=niche, 
+        language=lang, 
+        max_analyze=max_v,
+        subs_min=0,     # Default CLI
+        subs_max=500000 # Default CLI
+    )
+    
+    # Save CSV local
+    if results["csv_content"]:
+        with open("prospects_cli.csv", "w", encoding="utf-8") as f:
+            f.write(results["csv_content"])
+        print("\n💾 Saved to prospects_cli.csv")
 
 if __name__ == "__main__":
     main()
